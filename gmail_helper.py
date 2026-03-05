@@ -1,16 +1,20 @@
 """Gmail Helper - Interactive CLI to manage your Gmail inbox."""
 
+import json
 import sys
+import time
 from collections import defaultdict
-from typing import Optional
+from datetime import datetime
+from pathlib import Path
 
 from googleapiclient.discovery import build
-from rich import print as rprint
 from rich.console import Console
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 from auth import get_credentials
+
+CACHE_FILE = Path("sender_cache.json")
 
 console = Console()
 
@@ -46,16 +50,31 @@ def fetch_messages(service, query: str = "", max_results: int = 500) -> list[dic
     return messages
 
 
-def get_message_headers(service, msg_id: str) -> dict:
-    """Return a dict of selected headers for a message."""
-    msg = service.users().messages().get(
-        userId="me", id=msg_id, format="metadata",
-        metadataHeaders=["From", "Subject", "Date"]
-    ).execute()
-    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-    headers["id"] = msg_id
-    headers["labelIds"] = msg.get("labelIds", [])
-    return headers
+def get_senders_batch(service, msg_ids: list[str]) -> dict[str, str]:
+    """Fetch the From header for up to 100 messages in a single HTTP request.
+    Returns {msg_id: sender_string}."""
+    result: dict[str, str] = {}
+
+    def _cb(request_id, response, exception):
+        if exception or not response:
+            result[request_id] = "Unknown"
+            return
+        headers = {
+            h["name"]: h["value"]
+            for h in response.get("payload", {}).get("headers", [])
+        }
+        result[request_id] = headers.get("From", "Unknown")
+
+    batch = service.new_batch_http_request(callback=_cb)
+    for mid in msg_ids:
+        batch.add(
+            service.users().messages().get(
+                userId="me", id=mid, format="metadata", metadataHeaders=["From"]
+            ),
+            request_id=mid,
+        )
+    batch.execute()
+    return result
 
 
 def batch_delete(service, message_ids: list[str]) -> int:
@@ -95,14 +114,76 @@ def get_labels(service) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _cache_key(query: str, limit: int) -> str:
+    return f"{limit}|{query}"
+
+
+def _load_cache(query: str, limit: int):
+    """Return (sorted_senders, sender_ids, age_str) from cache, or None."""
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if data.get("key") != _cache_key(query, limit):
+        return None
+    age_secs = time.time() - data["timestamp"]
+    if age_secs < 3600:
+        age_str = f"{int(age_secs // 60)}m ago"
+    elif age_secs < 86400:
+        age_str = f"{age_secs / 3600:.1f}h ago"
+    else:
+        age_str = f"{age_secs / 86400:.1f}d ago"
+    sorted_senders = [tuple(x) for x in data["sorted_senders"]]
+    sender_ids = data["sender_ids"]
+    return sorted_senders, sender_ids, age_str
+
+
+def _save_cache(query: str, limit: int, sorted_senders: list, sender_ids: dict):
+    data = {
+        "key": _cache_key(query, limit),
+        "timestamp": time.time(),
+        "query": query,
+        "limit": limit,
+        "sorted_senders": sorted_senders,
+        "sender_ids": sender_ids,
+    }
+    CACHE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_cache():
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+        console.print("[green]Cache cleared.[/green]")
+    else:
+        console.print("[yellow]No cache file found.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
 # Feature: Sender analysis
 # ---------------------------------------------------------------------------
 
 def analyze_senders(service):
     console.print("\n[bold cyan]Analyzing senders...[/bold cyan]")
     limit = IntPrompt.ask("Max emails to scan", default=500)
-
     query = Prompt.ask("Optional Gmail search filter (leave blank for all)", default="")
+
+    # Check cache
+    cached = _load_cache(query, limit)
+    if cached:
+        sorted_senders, sender_ids, age_str = cached
+        console.print(
+            f"[yellow]Cache found[/yellow] (scanned {limit} emails, filter: '{query or 'none'}', saved {age_str}). "
+            "Use it?"
+        )
+        if Confirm.ask("Load from cache", default=True):
+            _display_and_act(service, sorted_senders, sender_ids)
+            return
+
     with console.status("Fetching messages..."):
         messages = fetch_messages(service, query=query, max_results=limit)
 
@@ -115,17 +196,26 @@ def analyze_senders(service):
     sender_counts: dict[str, int] = defaultdict(int)
     sender_ids: dict[str, list[str]] = defaultdict(list)
 
+    all_ids = [m["id"] for m in messages]
+    batch_size = 100  # Gmail API batch limit
     with console.status("Reading headers...") as status:
-        for i, msg in enumerate(messages):
-            if i % 50 == 0:
-                status.update(f"Reading headers... {i}/{len(messages)}")
-            headers = get_message_headers(service, msg["id"])
-            sender = headers.get("From", "Unknown")
-            sender_counts[sender] += 1
-            sender_ids[sender].append(msg["id"])
+        for i in range(0, len(all_ids), batch_size):
+            chunk = all_ids[i : i + batch_size]
+            status.update(f"Reading headers... {i}/{len(all_ids)}")
+            senders = get_senders_batch(service, chunk)
+            for mid, sender in senders.items():
+                sender_counts[sender] += 1
+                sender_ids[sender].append(mid)
 
     # Sort by count descending
     sorted_senders = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)
+
+    _save_cache(query, limit, sorted_senders, sender_ids)
+    console.print("[dim]Results cached to sender_cache.json[/dim]")
+    _display_and_act(service, sorted_senders, sender_ids)
+
+
+def _display_and_act(service, sorted_senders: list, sender_ids: dict):
 
     top_n = IntPrompt.ask("How many top senders to display", default=30)
 
@@ -304,6 +394,7 @@ MENU_OPTIONS = {
     "2": ("Search & bulk action (delete / trash / mark read)", search_and_act),
     "3": ("List all labels", list_labels),
     "4": ("Inbox stats", inbox_stats),
+    "5": ("Clear sender cache", lambda _: clear_cache()),
     "0": ("Exit", None),
 }
 

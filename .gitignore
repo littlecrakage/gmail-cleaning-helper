@@ -1,6 +1,7 @@
 venv/
 credentials.json
 token.json
+sender_cache.json
 __pycache__/
 *.pyc
 .claude/
