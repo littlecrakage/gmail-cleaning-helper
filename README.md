@@ -4,10 +4,11 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
 
 ## Features
 
-- **Sender analysis** - See how many emails each sender has sent, then act on them
+- **Sender analysis** - Scan emails, rank senders by count, then act on them (delete / trash / mark read). Results are cached locally so large scans don't need to be repeated.
 - **Search & bulk action** - Use any Gmail search query, then delete / trash / mark read
 - **Label listing** - View all your Gmail labels and their IDs
 - **Inbox stats** - Total messages, threads, and email address
+- **Clear sender cache** - Force a fresh scan on next run
 
 ## Setup
 
@@ -17,7 +18,7 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
 2. Create a new project (or select an existing one)
 3. Enable the **Gmail API**: APIs & Services > Library > search "Gmail API" > Enable
 4. Create credentials: APIs & Services > Credentials > Create Credentials > **OAuth 2.0 Client ID**
-   - Application type: **Desktop app**
+   - Application type: **Desktop app** (not Web application — this avoids redirect URI errors)
 5. Download the JSON file and save it as `credentials.json` in this directory
 6. Add your Gmail address as a **Test User**: APIs & Services > OAuth consent screen > Test users
 
@@ -47,13 +48,20 @@ On first run, a browser window will open asking you to authorize the app. After 
 |------|-------------|
 | `credentials.json` | OAuth client secrets (you provide this — do not commit) |
 | `token.json` | Saved auth token (auto-generated — do not commit) |
+| `sender_cache.json` | Cached sender scan results (auto-generated — do not commit) |
 | `auth.py` | OAuth2 login flow |
 | `gmail_helper.py` | Main interactive script |
 | `requirements.txt` | Python dependencies |
 | `setup.sh` | Virtual env setup script |
 
+## Performance
+
+The sender analysis fetches headers using **Gmail API batch requests** (100 messages per HTTP call), making large inbox scans significantly faster than sequential calls.
+
+Scan results are saved to `sender_cache.json`. On the next run with the same limit and filter, you'll be offered to reload from cache instead of re-scanning. Use menu option **5** to clear the cache and force a fresh scan.
+
 ## Security notes
 
 - This script uses **OAuth 2.0** — your password is never stored or sent to this script.
-- `credentials.json` and `token.json` give access to your Gmail. Add them to `.gitignore` if you use git.
-- The Gmail API scopes used: `gmail.readonly` + `gmail.modify` (no send/compose permissions).
+- `credentials.json` and `token.json` give access to your Gmail. They are listed in `.gitignore`.
+- The Gmail API scope used: `https://mail.google.com/` — required for permanent email deletion. No send or compose permissions are used.
