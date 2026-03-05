@@ -14,11 +14,16 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
 
 ## Features
 
-- **Sender analysis** - Scan emails, rank senders by count, then act on them (delete / trash / mark read). Results are cached locally so large scans don't need to be repeated.
+- **Sender analysis** - Scan emails, rank senders by count, then act on them (delete / trash / mark read / view emails). Results are cached locally so large scans don't need to be repeated.
+- **Smart tags** - Each sender is automatically tagged:
+  - `newsletter` — has `List-Unsubscribe`/`List-Id` headers or is in Gmail's Promotions/Updates/Social category
+  - `important` — at least one email was marked important by Gmail's ML
+- **Email viewer** - Browse a sender's emails (subject + from) with pagination, and filter to important-only before deciding to delete
 - **Search & bulk action** - Use any Gmail search query, then delete / trash / mark read
+- **Resume support** - Large scans are checkpointed every 200 emails. If interrupted, resume from where you left off
 - **Label listing** - View all your Gmail labels and their IDs
 - **Inbox stats** - Total messages, threads, and email address
-- **Clear sender cache** - Force a fresh scan on next run
+- **View / clear sender cache** - Browse cached results or force a fresh scan
 
 ## Setup
 
@@ -52,6 +57,23 @@ python gmail_helper.py
 
 On first run, a browser window will open asking you to authorize the app. After that, a `token.json` is saved locally and reused automatically.
 
+## Menu options
+
+| # | Option |
+|---|--------|
+| 1 | Analyze senders — scan inbox, rank by email count, act on each sender |
+| 2 | Search & bulk action — Gmail query → delete / trash / mark read |
+| 3 | List all labels |
+| 4 | Inbox stats |
+| 5 | View sender cache — browse cached results and act without re-scanning |
+| 6 | Clear sender cache — force a fresh scan next time |
+
+### Sender list navigation
+`[#]` select a sender · `[m]` next page · `[b]` back to top · `[0]` go back
+
+### Email viewer navigation (after selecting a sender → view)
+`[n]` next page · `[p]` prev page · `[i]` toggle important-only filter · `[q]` back to sender list
+
 ## Files
 
 | File | Description |
@@ -59,6 +81,7 @@ On first run, a browser window will open asking you to authorize the app. After 
 | `credentials.json` | OAuth client secrets (you provide this — do not commit) |
 | `token.json` | Saved auth token (auto-generated — do not commit) |
 | `sender_cache.json` | Cached sender scan results (auto-generated — do not commit) |
+| `api_errors.log` | API error log — 429s, 5xx, network failures (auto-generated — do not commit) |
 | `auth.py` | OAuth2 login flow |
 | `gmail_helper.py` | Main interactive script |
 | `requirements.txt` | Python dependencies |
@@ -66,9 +89,11 @@ On first run, a browser window will open asking you to authorize the app. After 
 
 ## Performance
 
-The sender analysis fetches headers using **Gmail API batch requests** (100 messages per HTTP call), making large inbox scans significantly faster than sequential calls.
+Sender analysis uses **8 parallel HTTP workers** with thread-local `AuthorizedSession` connections, fetching ~150 emails/second while staying within Gmail API quota limits.
 
-Scan results are saved to `sender_cache.json`. On the next run with the same limit and filter, you'll be offered to reload from cache instead of re-scanning. Use menu option **5** to clear the cache and force a fresh scan.
+- Retries automatically on 429 (rate limit), 5xx (server errors), and network exceptions — with exponential backoff up to 6 attempts
+- All API failures are logged to `api_errors.log` for inspection
+- Scan results are checkpointed every 200 emails to `sender_cache.json`. If interrupted, resume from where you left off on the next run. Use menu option **6** to clear the cache and force a fresh scan.
 
 ## Security notes
 
