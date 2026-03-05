@@ -1,5 +1,15 @@
 # Gmail Helper
 
+---
+
+## ⚠️ BIG FAT WARNING ⚠️
+
+> **THIS TOOL CAN PERMANENTLY DELETE EMAILS.**
+> **DELETED EMAILS ARE GONE FOREVER AND CANNOT BE RECOVERED.**
+> **USE AT YOUR OWN RISK. ALWAYS DOUBLE-CHECK BEFORE CONFIRMING ANY DELETE ACTION.**
+
+---
+
 A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, trash, and mark emails read/unread.
 
 ## Features

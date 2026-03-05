@@ -422,14 +422,15 @@ def _print_sender_page(sorted_senders: list, start: int, end: int, title_suffix:
     console.print(table)
 
 
-_EMAIL_VIEW_LIMIT = 50
+_EMAIL_FETCH_CAP = 200
+_EMAIL_PAGE_SIZE = 20
 
 
 def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
-    """Fetch and display subject + date for a sender's messages."""
-    sample = msg_ids[:_EMAIL_VIEW_LIMIT]
+    """Interactive paginated email viewer for a sender."""
+    sample = msg_ids[:_EMAIL_FETCH_CAP]
 
-    def fetch_subject(mid: str) -> tuple[str, str]:
+    def fetch_subject(mid: str) -> tuple[str, str, bool]:
         session = _get_session(creds)
         url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}"
         for attempt in range(6):
@@ -442,7 +443,8 @@ def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
                 if resp.status_code == 200:
                     data = resp.json()
                     hdrs = {h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])}
-                    return hdrs.get("subject", "(no subject)"), hdrs.get("from", "")
+                    is_important = "IMPORTANT" in data.get("labelIds", [])
+                    return hdrs.get("subject", "(no subject)"), hdrs.get("from", ""), is_important
                 elif resp.status_code == 429:
                     _api_log.warning(f"429 rate_limit  mid={mid}  attempt={attempt}  wait={wait:.1f}s")
                     time.sleep(wait)
@@ -457,21 +459,59 @@ def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
                 time.sleep(wait)
         else:
             _api_log.warning(f"all_retries_exhausted  mid={mid}")
-        return "(error)", ""
+        return "(error)", "", False
 
-    with console.status(f"Fetching {len(sample)} subjects..."):
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            rows = list(executor.map(fetch_subject, sample))
+    with console.status(f"Fetching {len(sample)} email subjects..."):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            all_rows: list[tuple[str, str, bool]] = list(executor.map(fetch_subject, sample))
 
-    table = Table(title=f"Emails from: {sender}", show_lines=False)
-    table.add_column("#", style="dim", width=4)
-    table.add_column("From", style="dim", no_wrap=True)
-    table.add_column("Subject", style="cyan", no_wrap=False)
-    for i, (subject, from_hdr) in enumerate(rows, 1):
-        table.add_row(str(i), from_hdr, subject)
-    console.print(table)
-    if len(msg_ids) > _EMAIL_VIEW_LIMIT:
-        console.print(f"[dim]Showing first {_EMAIL_VIEW_LIMIT} of {len(msg_ids)} emails.[/dim]")
+    important_only = False
+    page = 0
+
+    while True:
+        rows = [r for r in all_rows if not important_only or r[2]]
+        total_pages = max(1, (len(rows) + _EMAIL_PAGE_SIZE - 1) // _EMAIL_PAGE_SIZE)
+        page = min(page, total_pages - 1)
+        start = page * _EMAIL_PAGE_SIZE
+        end = min(start + _EMAIL_PAGE_SIZE, len(rows))
+
+        filter_label = " [important only]" if important_only else ""
+        title = f"Emails from: {sender}{filter_label} — {start + 1}–{end} of {len(rows)}"
+        table = Table(title=title, show_lines=False)
+        table.add_column("#", style="dim", width=4)
+        table.add_column("From", style="dim", no_wrap=True)
+        table.add_column("Subject", style="cyan", no_wrap=False)
+        for i, (subject, from_hdr, is_imp) in enumerate(rows[start:end], start + 1):
+            subj_display = f"[bold]{subject}[/bold]" if is_imp else subject
+            table.add_row(str(i), from_hdr, subj_display)
+        console.print(table)
+
+        if len(msg_ids) > _EMAIL_FETCH_CAP:
+            console.print(f"[dim]Fetched first {_EMAIL_FETCH_CAP} of {len(msg_ids)} emails.[/dim]")
+
+        has_next = end < len(rows)
+        has_prev = page > 0
+        nav = []
+        if has_next:
+            nav.append("[bold]n[/bold] next page")
+        if has_prev:
+            nav.append("[bold]p[/bold] prev page")
+        nav.append("[bold]i[/bold] " + ("show all" if important_only else "important only"))
+        nav.append("[bold]0[/bold] back to sender list")
+        console.print("\n" + " | ".join(nav))
+
+        raw = Prompt.ask("Choice").strip().lower()
+        if raw == "0":
+            break
+        elif raw == "n" and has_next:
+            page += 1
+        elif raw == "p" and has_prev:
+            page -= 1
+        elif raw == "i":
+            important_only = not important_only
+            page = 0
+        else:
+            console.print("[red]Invalid choice.[/red]")
 
 
 def _remove_sender_from_cache(sender: str):
@@ -770,6 +810,12 @@ MENU_OPTIONS = {
 
 def main():
     console.print("[bold magenta]Gmail Helper[/bold magenta]", justify="center")
+    console.print()
+    console.print("[bold red on white] ⚠  BIG FAT WARNING  ⚠ [/bold red on white]", justify="center")
+    console.print("[bold red]THIS TOOL CAN PERMANENTLY DELETE EMAILS.[/bold red]", justify="center")
+    console.print("[bold red]DELETED EMAILS ARE GONE FOREVER AND CANNOT BE RECOVERED.[/bold red]", justify="center")
+    console.print("[bold red]USE AT YOUR OWN RISK.[/bold red]", justify="center")
+    console.print()
     console.print("[dim]Connecting to Gmail...[/dim]")
 
     try:
