@@ -493,15 +493,15 @@ def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
         has_prev = page > 0
         nav = []
         if has_next:
-            nav.append("[bold]n[/bold] next page")
+            nav.append("[bold cyan]\[n][/bold cyan] next page")
         if has_prev:
-            nav.append("[bold]p[/bold] prev page")
-        nav.append("[bold]i[/bold] " + ("show all" if important_only else "important only"))
-        nav.append("[bold]0[/bold] back to sender list")
-        console.print("\n" + " | ".join(nav))
+            nav.append("[bold cyan]\[p][/bold cyan] prev page")
+        nav.append("[bold cyan]\[i][/bold cyan] " + ("show all" if important_only else "important only"))
+        nav.append("[bold cyan]\[q][/bold cyan] back to sender list")
+        console.print("\n" + "   ".join(nav))
 
         raw = Prompt.ask("Choice").strip().lower()
-        if raw == "0":
+        if raw in ("q", "0", "o"):
             break
         elif raw == "n" and has_next:
             page += 1
@@ -552,12 +552,13 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                 f"[dim]Showing {shown_up_to} of {len(sorted_senders)} senders.[/dim]"
             )
 
-        console.print(
-            "\n[bold]Actions:[/bold] enter a sender [bold]#[/bold] to act on it"
-            + (" | [bold]m[/bold] more senders" if has_more else "")
-            + " | [bold]0[/bold] to go back"
-            + (" | [bold]b[/bold] back to top" if page_start > 0 else "")
-        )
+        nav_parts = ["[bold cyan]\[#][/bold cyan] select sender"]
+        if has_more:
+            nav_parts.append("[bold cyan]\[m][/bold cyan] more senders")
+        if page_start > 0:
+            nav_parts.append("[bold cyan]\[b][/bold cyan] back to top")
+        nav_parts.append("[bold cyan]\[0][/bold cyan] go back")
+        console.print("\n" + "   ".join(nav_parts))
         raw = Prompt.ask("Choice")
 
         if raw.strip() == "0":
