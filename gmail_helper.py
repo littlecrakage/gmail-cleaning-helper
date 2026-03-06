@@ -170,6 +170,30 @@ def get_labels(service) -> list[dict]:
     return result.get("labels", [])
 
 
+def get_or_create_label(service, name: str) -> str:
+    """Return label ID for the given name, creating it if it doesn't exist.
+    Retries up to 4 times on transient errors (503, 500, etc.)."""
+    for attempt in range(4):
+        try:
+            labels = get_labels(service)
+            for lbl in labels:
+                if lbl["name"].lower() == name.lower():
+                    return lbl["id"]
+            new_label = service.users().labels().create(
+                userId="me",
+                body={"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"},
+            ).execute()
+            return new_label["id"]
+        except Exception as e:
+            err_str = str(e)
+            if attempt < 3 and ("503" in err_str or "500" in err_str or "backendError" in err_str):
+                wait = 2 ** attempt + random.uniform(0, 1)
+                _api_log.warning(f"get_or_create_label  attempt={attempt}  wait={wait:.1f}s  error={e}")
+                time.sleep(wait)
+            else:
+                raise
+
+
 # ---------------------------------------------------------------------------
 # Cache helpers
 # ---------------------------------------------------------------------------
@@ -518,6 +542,12 @@ def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
             console.print("[red]Invalid choice.[/red]")
 
 
+def _sender_to_email(sender: str) -> str:
+    """Extract bare email address from a 'Name <email>' or plain 'email' string."""
+    m = re.search(r"<([^>]+)>", sender)
+    return m.group(1).strip() if m else sender.strip()
+
+
 def _parse_selection(raw: str, max_n: int) -> list[int] | None:
     """Parse a comma-separated / range selection string into a deduplicated list of 1-based indices.
     Returns None on parse error or out-of-range input."""
@@ -572,6 +602,7 @@ def _remove_sender_from_cache(sender: str):
 def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suffix: str = "", sender_tags: dict | None = None, creds=None):
     page_start = 0
     redisplay = True
+    dry_run = False
 
     while True:
         # (Re)display current page only when needed
@@ -586,11 +617,15 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                 f"[dim]Showing {shown_up_to} of {len(sorted_senders)} senders.[/dim]"
             )
 
+        if dry_run:
+            console.print("[bold yellow]DRY RUN — no changes will be made[/bold yellow]")
+
         nav_parts = ["[bold cyan]\\[#][/bold cyan] select sender(s)  [dim](e.g. 1  or  1,3,5  or  2-6)[/dim]"]
         if has_more:
             nav_parts.append("[bold cyan]\\[m][/bold cyan] more senders")
         if page_start > 0:
             nav_parts.append("[bold cyan]\\[b][/bold cyan] back to top")
+        nav_parts.append(f"[bold cyan]\\[dr][/bold cyan] {'disable' if dry_run else 'enable'} dry run")
         nav_parts.append("[bold cyan]\\[0][/bold cyan] go back")
         console.print("\n" + "   ".join(nav_parts))
         raw = Prompt.ask("Choice")
@@ -607,6 +642,11 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
         if raw.strip().lower() == "b":
             page_start = 0
             continue
+        if raw.strip().lower() == "dr":
+            dry_run = not dry_run
+            console.print(f"[yellow]Dry run {'enabled' if dry_run else 'disabled'}.[/yellow]")
+            redisplay = False
+            continue
 
         selected_indices = _parse_selection(raw, len(sorted_senders))
         if selected_indices is None:
@@ -621,13 +661,13 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             console.print(f"\nSelected [cyan]{len(selected_indices)} senders[/cyan] ({total_count} emails total):")
             for n, name in zip(selected_indices, names):
                 console.print(f"  [dim]{n}.[/dim] {name}")
-            action_choices = ["delete", "trash", "mark_read", "mark_unread", "back"]
+            action_choices = ["delete", "trash", "mark_read", "mark_unread", "label", "query", "back"]
         else:
             idx = selected_indices[0] - 1
             sender, count = sorted_senders[idx]
             ids = sender_ids[sender]
             console.print(f"\nSelected: [cyan]{sender}[/cyan] ({count} emails)")
-            action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "back"] if creds else ["delete", "trash", "mark_read", "mark_unread", "back"]
+            action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "label", "query", "back"] if creds else ["delete", "trash", "mark_read", "mark_unread", "label", "query", "back"]
 
         action = Prompt.ask(
             "Action",
@@ -649,7 +689,9 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
         if action == "delete":
             total = sum(c for _, _, c in targets)
             label = f"{len(targets)} senders ({total} emails)" if multi else f"all {targets[0][2]} emails from {targets[0][1]}"
-            if Confirm.ask(f"Permanently delete {label}?"):
+            if dry_run:
+                console.print(f"[yellow][DRY RUN][/yellow] Would permanently delete {label}.")
+            elif Confirm.ask(f"Permanently delete {label}?"):
                 with console.status("Deleting..."):
                     for _, s, _ in targets:
                         batch_delete(service, sender_ids[s])
@@ -665,7 +707,9 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
         elif action == "trash":
             total = sum(c for _, _, c in targets)
             label = f"{len(targets)} senders ({total} emails)" if multi else f"{targets[0][2]} emails from {targets[0][1]}"
-            if Confirm.ask(f"Move {label} to Trash?"):
+            if dry_run:
+                console.print(f"[yellow][DRY RUN][/yellow] Would move {label} to Trash.")
+            elif Confirm.ask(f"Move {label} to Trash?"):
                 with console.status("Moving to Trash..."):
                     for _, s, _ in targets:
                         batch_modify(service, sender_ids[s], add_labels=["TRASH"], remove_labels=["INBOX"])
@@ -678,16 +722,57 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                     _remove_sender_from_cache(s)
                 page_start = min(page_start, max(0, len(sorted_senders) - 1))
         elif action == "mark_read":
-            with console.status("Marking as read..."):
-                for _, s, _ in targets:
-                    batch_modify(service, sender_ids[s], remove_labels=["UNREAD"])
-            console.print(f"[green]Marked emails from {len(targets)} sender(s) as read.[/green]")
+            if dry_run:
+                total = sum(c for _, _, c in targets)
+                console.print(f"[yellow][DRY RUN][/yellow] Would mark {total} emails from {len(targets)} sender(s) as read.")
+            else:
+                with console.status("Marking as read..."):
+                    for _, s, _ in targets:
+                        batch_modify(service, sender_ids[s], remove_labels=["UNREAD"])
+                console.print(f"[green]Marked emails from {len(targets)} sender(s) as read.[/green]")
         elif action == "mark_unread":
-            with console.status("Marking as unread..."):
-                for _, s, _ in targets:
-                    batch_modify(service, sender_ids[s], add_labels=["UNREAD"])
-            console.print(f"[green]Marked emails from {len(targets)} sender(s) as unread.[/green]")
-
+            if dry_run:
+                total = sum(c for _, _, c in targets)
+                console.print(f"[yellow][DRY RUN][/yellow] Would mark {total} emails from {len(targets)} sender(s) as unread.")
+            else:
+                with console.status("Marking as unread..."):
+                    for _, s, _ in targets:
+                        batch_modify(service, sender_ids[s], add_labels=["UNREAD"])
+                console.print(f"[green]Marked emails from {len(targets)} sender(s) as unread.[/green]")
+        elif action == "label":
+            with console.status("Fetching labels..."):
+                all_labels = get_labels(service)
+            user_labels = sorted(
+                [l for l in all_labels if l.get("type") == "user"],
+                key=lambda l: l["name"].lower(),
+            )
+            if user_labels:
+                console.print("\n[dim]Existing labels:[/dim]")
+                for lbl in user_labels:
+                    console.print(f"  [dim]·[/dim] {lbl['name']}")
+                console.print()
+            label_name = Prompt.ask("Label name (existing or new)").strip()
+            if not label_name:
+                console.print("[yellow]No label name entered, skipping.[/yellow]")
+                continue
+            if dry_run:
+                total = sum(c for _, _, c in targets)
+                console.print(f"[yellow][DRY RUN][/yellow] Would apply label '[bold]{label_name}[/bold]' to {total} emails from {len(targets)} sender(s).")
+            else:
+                with console.status(f"Applying label '{label_name}'..."):
+                    label_id = get_or_create_label(service, label_name)
+                    for _, s, _ in targets:
+                        batch_modify(service, sender_ids[s], add_labels=[label_id])
+                console.print(f"[green]Applied label '[bold]{label_name}[/bold]' to emails from {len(targets)} sender(s).[/green]")
+        elif action == "query":
+            emails = [_sender_to_email(s) for _, s, _ in targets]
+            if len(emails) == 1:
+                query_str = f"from:{emails[0]}"
+            else:
+                query_str = " OR ".join(f"from:{e}" for e in emails)
+            console.print(f"\n[bold]Gmail search query:[/bold]")
+            console.print(f"[bold cyan]{query_str}[/bold cyan]\n")
+            console.print("[dim]Paste this into the Gmail search bar.[/dim]")
 
 
 # ---------------------------------------------------------------------------
