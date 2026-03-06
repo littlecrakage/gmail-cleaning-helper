@@ -6,6 +6,7 @@ import random
 import sys
 import threading
 import time
+import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -798,6 +799,9 @@ def view_cache(service, creds=None):
 # Main menu
 # ---------------------------------------------------------------------------
 
+GITHUB_URL = "https://github.com/littlecrakage/gmail-cleaning-helper"
+KOFI_URL = "https://ko-fi.com/crakage"
+
 MENU_OPTIONS = {
     "1": ("Analyze senders (count emails per sender)", analyze_senders),
     "2": ("Search & bulk action (delete / trash / mark read)", search_and_act),
@@ -805,8 +809,15 @@ MENU_OPTIONS = {
     "4": ("Inbox stats", inbox_stats),
     "5": ("View sender cache", view_cache),
     "6": ("Clear sender cache", lambda _: clear_cache()),
+    "7": ("Contact / Feedback (GitHub)", lambda _: _open_url(GITHUB_URL)),
+    "8": ("Support me (Ko-fi)", lambda _: _open_url(KOFI_URL)),
     "0": ("Exit", None),
 }
+
+
+def _open_url(url: str):
+    console.print(f"[dim]Opening {url} ...[/dim]")
+    webbrowser.open(url)
 
 
 def main():
