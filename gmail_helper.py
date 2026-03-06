@@ -3,9 +3,12 @@
 import json
 import logging
 import random
+import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -515,6 +518,36 @@ def _view_sender_emails(creds, sender: str, msg_ids: list[str]):
             console.print("[red]Invalid choice.[/red]")
 
 
+def _parse_selection(raw: str, max_n: int) -> list[int] | None:
+    """Parse a comma-separated / range selection string into a deduplicated list of 1-based indices.
+    Returns None on parse error or out-of-range input."""
+    indices: list[int] = []
+    for token in raw.strip().split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token and not token.lstrip("-").isdigit():
+            parts = token.split("-", 1)
+            try:
+                lo, hi = int(parts[0].strip()), int(parts[1].strip())
+                indices.extend(range(lo, hi + 1))
+            except ValueError:
+                return None
+        else:
+            try:
+                indices.append(int(token))
+            except ValueError:
+                return None
+
+    if not indices:
+        return None
+    if any(n < 1 or n > max_n for n in indices):
+        return None
+
+    seen: set[int] = set()
+    return [n for n in indices if not (n in seen or seen.add(n))]
+
+
 def _remove_sender_from_cache(sender: str):
     """Remove a sender from the cache file (both complete and partial formats)."""
     if not CACHE_FILE.exists():
@@ -575,40 +608,10 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             page_start = 0
             continue
 
-        # Parse single number, comma-separated list, or range (e.g. "2-6")
-        selected_indices: list[int] = []
-        parse_error = False
-        for token in raw.strip().split(","):
-            token = token.strip()
-            if "-" in token and not token.lstrip("-").isdigit():
-                # range like "2-6"
-                parts = token.split("-", 1)
-                try:
-                    lo, hi = int(parts[0].strip()), int(parts[1].strip())
-                    selected_indices.extend(range(lo, hi + 1))
-                except ValueError:
-                    parse_error = True
-                    break
-            else:
-                try:
-                    selected_indices.append(int(token))
-                except ValueError:
-                    parse_error = True
-                    break
-
-        if parse_error or not selected_indices:
+        selected_indices = _parse_selection(raw, len(sorted_senders))
+        if selected_indices is None:
             console.print("[red]Enter number(s), e.g. 1  or  1,3,5  or  2-6.[/red]")
             continue
-
-        # Validate all indices
-        invalid = [n for n in selected_indices if n < 1 or n > len(sorted_senders)]
-        if invalid:
-            console.print(f"[red]Out of range: {invalid}. Valid range: 1–{len(sorted_senders)}.[/red]")
-            continue
-
-        # Deduplicate preserving order
-        seen: set[int] = set()
-        selected_indices = [n for n in selected_indices if not (n in seen or seen.add(n))]
 
         multi = len(selected_indices) > 1
 
@@ -846,6 +849,174 @@ def view_cache(service, creds=None):
 
 
 # ---------------------------------------------------------------------------
+# Feature: Bulk unsubscribe
+# ---------------------------------------------------------------------------
+
+def _parse_list_unsubscribe(header_value: str) -> tuple[str | None, str | None]:
+    """Return (https_url, mailto_url) from a List-Unsubscribe header value."""
+    https_url = None
+    mailto_url = None
+    for match in re.finditer(r"<([^>]+)>", header_value):
+        url = match.group(1).strip()
+        if (url.startswith("https://") or url.startswith("http://")) and not https_url:
+            https_url = url
+        elif url.startswith("mailto:") and not mailto_url:
+            mailto_url = url
+    return https_url, mailto_url
+
+
+def _fetch_unsubscribe_info(creds, msg_id: str) -> tuple[str | None, str | None, bool]:
+    """Fetch List-Unsubscribe headers from a message.
+    Returns (https_url, mailto_url, has_one_click)."""
+    session = _get_session(creds)
+    url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}"
+    for attempt in range(6):
+        wait = (2 ** attempt) + random.uniform(0, 1)
+        try:
+            resp = session.get(url, params={
+                "format": "metadata",
+                "metadataHeaders": ["List-Unsubscribe", "List-Unsubscribe-Post"],
+            })
+            if resp.status_code == 200:
+                data = resp.json()
+                hdrs = {h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])}
+                unsub = hdrs.get("list-unsubscribe", "")
+                post = hdrs.get("list-unsubscribe-post", "")
+                https_url, mailto_url = _parse_list_unsubscribe(unsub)
+                has_one_click = "one-click" in post.lower() and https_url is not None
+                return https_url, mailto_url, has_one_click
+            elif resp.status_code == 429 or resp.status_code >= 500:
+                time.sleep(wait)
+            else:
+                break
+        except Exception:
+            time.sleep(wait)
+    return None, None, False
+
+
+def bulk_unsubscribe(service, creds):
+    """List newsletter senders and unsubscribe via List-Unsubscribe headers."""
+    if not CACHE_FILE.exists():
+        console.print("[yellow]No sender cache found. Run a sender analysis first (option 1 or 6).[/yellow]")
+        return
+
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Failed to read cache:[/red] {e}")
+        return
+
+    sender_tags = {k: set(v) for k, v in data.get("sender_tags", {}).items()}
+    sender_ids = data.get("sender_ids", {})
+
+    if data.get("partial"):
+        sender_counts = data.get("sender_counts", {})
+        all_senders = sorted(sender_counts.items(), key=lambda x: x[1], reverse=True)
+    else:
+        raw_senders = data.get("sorted_senders", [])
+        all_senders = sorted((tuple(x) for x in raw_senders), key=lambda x: x[1], reverse=True)
+
+    newsletter_senders = sorted(
+        ((s, c) for s, c in all_senders if "newsletter" in sender_tags.get(s, set())),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:30]
+
+    if not newsletter_senders:
+        console.print("[yellow]No newsletter senders in cache. Run a sender analysis first.[/yellow]")
+        return
+
+    console.print(f"\n[bold cyan]Newsletter Senders[/bold cyan] — top {len(newsletter_senders)} by email count\n")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Sender")
+    table.add_column("Emails", justify="right")
+    for i, (sender, count) in enumerate(newsletter_senders, 1):
+        table.add_row(str(i), sender, str(count))
+    console.print(table)
+
+    console.print("\n[bold cyan]\\[#][/bold cyan] select sender(s)  [dim](e.g. 1  or  1,3,5  or  2-6)[/dim]   [bold cyan]\\[0][/bold cyan] go back")
+    raw = Prompt.ask("Choice")
+
+    if raw.strip() == "0":
+        return
+
+    selected_indices = _parse_selection(raw, len(newsletter_senders))
+    if selected_indices is None:
+        console.print("[red]Enter number(s), e.g. 1  or  1,3,5  or  2-6.[/red]")
+        return
+
+    targets = [(newsletter_senders[i - 1][0], newsletter_senders[i - 1][1]) for i in selected_indices]
+    console.print(f"\nAttempting to unsubscribe from [bold]{len(targets)}[/bold] sender(s).\n")
+
+    ok_senders: list[str] = []
+
+    for sender, count in targets:
+        ids = sender_ids.get(sender, [])
+        console.print(f"[cyan]{sender}[/cyan]")
+        if not ids:
+            console.print("  [yellow]No emails found in cache for this sender.[/yellow]")
+            continue
+
+        with console.status("  Fetching unsubscribe info..."):
+            https_url, mailto_url, has_one_click = _fetch_unsubscribe_info(creds, ids[0])
+
+        if has_one_click and https_url:
+            console.print(f"  [dim]One-click POST → {https_url[:70]}[/dim]")
+            try:
+                req = urllib.request.Request(
+                    https_url,
+                    data=b"List-Unsubscribe=One-Click",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    status_code = resp.status
+                if status_code < 400:
+                    console.print("  [green]Unsubscribed (one-click).[/green]")
+                    ok_senders.append(sender)
+                else:
+                    console.print(f"  [yellow]POST returned {status_code}. Opening browser as fallback...[/yellow]")
+                    webbrowser.open(https_url)
+                    ok_senders.append(sender)
+            except Exception as e:
+                console.print(f"  [yellow]POST failed ({e}). Opening browser as fallback...[/yellow]")
+                webbrowser.open(https_url)
+                ok_senders.append(sender)
+        elif https_url:
+            console.print(f"  [dim]Opening unsubscribe page in browser...[/dim]")
+            webbrowser.open(https_url)
+            ok_senders.append(sender)
+        elif mailto_url:
+            console.print(f"  [dim]Opening mailto unsubscribe link...[/dim]")
+            webbrowser.open(mailto_url)
+            ok_senders.append(sender)
+        else:
+            console.print("  [yellow]No unsubscribe link found in this sender's emails.[/yellow]")
+
+    console.print(f"\n[bold]Done.[/bold] Triggered unsubscribe for {len(ok_senders)}/{len(targets)} sender(s).")
+
+    if not ok_senders:
+        return
+
+    if Confirm.ask("\nAlso delete all existing emails from these senders?"):
+        action = Prompt.ask("Action", choices=["delete", "trash"], default="trash")
+        for sender in ok_senders:
+            ids = sender_ids.get(sender, [])
+            if not ids:
+                continue
+            if action == "delete":
+                with console.status(f"Deleting {sender}..."):
+                    batch_delete(service, ids)
+            else:
+                with console.status(f"Trashing {sender}..."):
+                    batch_modify(service, ids, add_labels=["TRASH"], remove_labels=["INBOX"])
+            _remove_sender_from_cache(sender)
+        console.print(f"[green]Done.[/green]")
+
+
+# ---------------------------------------------------------------------------
 # Main menu
 # ---------------------------------------------------------------------------
 
@@ -855,12 +1026,13 @@ KOFI_URL = "https://ko-fi.com/crakage"
 MENU_OPTIONS = {
     "1": ("Analyze senders (count emails per sender)", analyze_senders),
     "2": ("Search & bulk action (delete / trash / mark read)", search_and_act),
-    "3": ("List all labels", list_labels),
-    "4": ("Inbox stats", inbox_stats),
-    "5": ("View sender cache", view_cache),
-    "6": ("Clear sender cache", lambda _: clear_cache()),
-    "7": ("Contact / Feedback (GitHub)", lambda _: _open_url(GITHUB_URL)),
-    "8": ("Support me (Ko-fi)", lambda _: _open_url(KOFI_URL)),
+    "3": ("Unsubscribe from newsletters", bulk_unsubscribe),
+    "4": ("List all labels", list_labels),
+    "5": ("Inbox stats", inbox_stats),
+    "6": ("View sender cache", view_cache),
+    "7": ("Clear sender cache", lambda _: clear_cache()),
+    "8": ("Contact / Feedback (GitHub)", lambda _: _open_url(GITHUB_URL)),
+    "9": ("Support me (Ko-fi)", lambda _: _open_url(KOFI_URL)),
     "0": ("Exit", None),
 }
 
@@ -893,12 +1065,14 @@ def main():
 
     # Wrap functions that need creds
     def _analyze(svc): analyze_senders(svc, creds)
+    def _unsubscribe(svc): bulk_unsubscribe(svc, creds)
     def _view_cache(svc): view_cache(svc, creds)
 
     menu = {
         **MENU_OPTIONS,
         "1": ("Analyze senders (count emails per sender)", _analyze),
-        "5": ("View sender cache", _view_cache),
+        "3": ("Unsubscribe from newsletters", _unsubscribe),
+        "6": ("View sender cache", _view_cache),
     }
 
     while True:

@@ -10,7 +10,7 @@
 
 ---
 
-A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, trash, and mark emails read/unread.
+A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, trash, mark emails read/unread, and unsubscribe from newsletters.
 
 ## Features
 
@@ -19,6 +19,11 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
 - **Smart tags** - Each sender is automatically tagged:
   - `newsletter` — has `List-Unsubscribe`/`List-Id` headers or is in Gmail's Promotions/Updates/Social category
   - `important` — at least one email was marked important by Gmail's ML
+- **Bulk unsubscribe** - Lists all newsletter-tagged senders and triggers unsubscribe for selected ones:
+  - Supports RFC 8058 one-click POST (fully automatic)
+  - Falls back to opening the unsubscribe URL in your browser
+  - Falls back to opening the `mailto:` unsubscribe link in your mail client
+  - Optionally deletes or trashes all emails from unsubscribed senders
 - **Email viewer** - Browse a sender's emails (subject + from) with pagination, and filter to important-only before deciding to delete
 - **Search & bulk action** - Use any Gmail search query, then delete / trash / mark read
 - **Resume support** - Large scans are checkpointed every 200 emails. If interrupted, resume from where you left off
@@ -64,12 +69,13 @@ On first run, a browser window will open asking you to authorize the app. After 
 |---|--------|
 | 1 | Analyze senders — scan inbox, rank by email count, act on each sender |
 | 2 | Search & bulk action — Gmail query → delete / trash / mark read |
-| 3 | List all labels |
-| 4 | Inbox stats |
-| 5 | View sender cache — browse cached results and act without re-scanning |
-| 6 | Clear sender cache — force a fresh scan next time |
-| 7 | Contact / Feedback — opens the GitHub repository |
-| 8 | Support me — opens Ko-fi page |
+| 3 | Unsubscribe from newsletters — list newsletter senders, trigger unsubscribe, optionally delete emails |
+| 4 | List all labels |
+| 5 | Inbox stats |
+| 6 | View sender cache — browse cached results and act without re-scanning |
+| 7 | Clear sender cache — force a fresh scan next time |
+| 8 | Contact / Feedback — opens the GitHub repository |
+| 9 | Support me — opens Ko-fi page |
 
 ### Sender list navigation
 
@@ -81,6 +87,21 @@ Spaces after commas are fine: `1, 3, 5` works too.
 
 ### Email viewer navigation (after selecting a sender → view)
 `[n]` next page · `[p]` prev page · `[i]` toggle important-only filter · `[q]` back to sender list
+
+## How unsubscribe works
+
+Option 3 reads the `List-Unsubscribe` header from your emails to find the unsubscribe mechanism for each newsletter sender.
+
+| Method | When used |
+|--------|-----------|
+| One-click POST (RFC 8058) | Sender supports it — fully automatic, no browser needed |
+| Open URL in browser | Sender has an HTTPS unsubscribe link |
+| Open mailto in mail client | Sender only provides an email-based unsubscribe |
+| No link found | Some senders don't include a `List-Unsubscribe` header |
+
+After unsubscribing you are offered the option to delete or trash all existing emails from those senders.
+
+> **Note:** Unsubscribe only works for senders identified in the sender cache. Run option 1 (Analyze senders) first.
 
 ## Files
 
@@ -101,7 +122,7 @@ Sender analysis uses **8 parallel HTTP workers** with thread-local `AuthorizedSe
 
 - Retries automatically on 429 (rate limit), 5xx (server errors), and network exceptions — with exponential backoff up to 6 attempts
 - All API failures are logged to `api_errors.log` for inspection
-- Scan results are checkpointed every 200 emails to `sender_cache.json`. If interrupted, resume from where you left off on the next run. Use menu option **6** to clear the cache and force a fresh scan.
+- Scan results are checkpointed every 200 emails to `sender_cache.json`. If interrupted, resume from where you left off on the next run. Use menu option **7** to clear the cache and force a fresh scan.
 
 ## Security notes
 
