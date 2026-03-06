@@ -553,7 +553,7 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                 f"[dim]Showing {shown_up_to} of {len(sorted_senders)} senders.[/dim]"
             )
 
-        nav_parts = ["[bold cyan]\\[#][/bold cyan] select sender"]
+        nav_parts = ["[bold cyan]\\[#][/bold cyan] select sender(s)  [dim](e.g. 1  or  1,3,5  or  2-6)[/dim]"]
         if has_more:
             nav_parts.append("[bold cyan]\\[m][/bold cyan] more senders")
         if page_start > 0:
@@ -575,22 +575,57 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             page_start = 0
             continue
 
-        try:
-            choice = int(raw)
-        except ValueError:
-            console.print("[red]Enter a number or 'm'.[/red]")
+        # Parse single number, comma-separated list, or range (e.g. "2-6")
+        selected_indices: list[int] = []
+        parse_error = False
+        for token in raw.strip().split(","):
+            token = token.strip()
+            if "-" in token and not token.lstrip("-").isdigit():
+                # range like "2-6"
+                parts = token.split("-", 1)
+                try:
+                    lo, hi = int(parts[0].strip()), int(parts[1].strip())
+                    selected_indices.extend(range(lo, hi + 1))
+                except ValueError:
+                    parse_error = True
+                    break
+            else:
+                try:
+                    selected_indices.append(int(token))
+                except ValueError:
+                    parse_error = True
+                    break
+
+        if parse_error or not selected_indices:
+            console.print("[red]Enter number(s), e.g. 1  or  1,3,5  or  2-6.[/red]")
             continue
 
-        if choice < 1 or choice > len(sorted_senders):
-            console.print(f"[red]Enter a number between 1 and {len(sorted_senders)}.[/red]")
+        # Validate all indices
+        invalid = [n for n in selected_indices if n < 1 or n > len(sorted_senders)]
+        if invalid:
+            console.print(f"[red]Out of range: {invalid}. Valid range: 1–{len(sorted_senders)}.[/red]")
             continue
 
-        idx = choice - 1
-        sender, count = sorted_senders[idx]
-        ids = sender_ids[sender]
-        console.print(f"\nSelected: [cyan]{sender}[/cyan] ({count} emails)")
+        # Deduplicate preserving order
+        seen: set[int] = set()
+        selected_indices = [n for n in selected_indices if not (n in seen or seen.add(n))]
 
-        action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "back"] if creds else ["delete", "trash", "mark_read", "mark_unread", "back"]
+        multi = len(selected_indices) > 1
+
+        if multi:
+            names = [sorted_senders[i - 1][0] for i in selected_indices]
+            total_count = sum(sorted_senders[i - 1][1] for i in selected_indices)
+            console.print(f"\nSelected [cyan]{len(selected_indices)} senders[/cyan] ({total_count} emails total):")
+            for n, name in zip(selected_indices, names):
+                console.print(f"  [dim]{n}.[/dim] {name}")
+            action_choices = ["delete", "trash", "mark_read", "mark_unread", "back"]
+        else:
+            idx = selected_indices[0] - 1
+            sender, count = sorted_senders[idx]
+            ids = sender_ids[sender]
+            console.print(f"\nSelected: [cyan]{sender}[/cyan] ({count} emails)")
+            action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "back"] if creds else ["delete", "trash", "mark_read", "mark_unread", "back"]
+
         action = Prompt.ask(
             "Action",
             choices=action_choices,
@@ -599,41 +634,56 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
 
         if action == "back":
             continue
-        elif action == "view":
+
+        if not multi and action == "view":
             _view_sender_emails(creds, sender, ids)
-            redisplay = False
             continue
-        elif action == "delete":
-            if Confirm.ask(f"Permanently delete all {count} emails from this sender?"):
+
+        # --- Multi or single action ---
+        # Collect senders to act on (process in reverse index order for safe removal)
+        targets = [(i - 1, sorted_senders[i - 1][0], sorted_senders[i - 1][1]) for i in selected_indices]
+
+        if action == "delete":
+            total = sum(c for _, _, c in targets)
+            label = f"{len(targets)} senders ({total} emails)" if multi else f"all {targets[0][2]} emails from {targets[0][1]}"
+            if Confirm.ask(f"Permanently delete {label}?"):
                 with console.status("Deleting..."):
-                    n = batch_delete(service, ids)
-                console.print(f"[green]Deleted {n} emails.[/green]")
-                sorted_senders.pop(idx)
-                sender_ids.pop(sender, None)
-                if sender_tags:
-                    sender_tags.pop(sender, None)
-                _remove_sender_from_cache(sender)
-                # Keep page_start; clamp if we're now past end of list
+                    for _, s, _ in targets:
+                        batch_delete(service, sender_ids[s])
+                n_deleted = len(targets)
+                console.print(f"[green]Deleted emails from {n_deleted} sender(s).[/green]")
+                for idx_, s, _ in sorted(targets, key=lambda x: x[0], reverse=True):
+                    sorted_senders.pop(idx_)
+                    sender_ids.pop(s, None)
+                    if sender_tags:
+                        sender_tags.pop(s, None)
+                    _remove_sender_from_cache(s)
                 page_start = min(page_start, max(0, len(sorted_senders) - 1))
         elif action == "trash":
-            if Confirm.ask(f"Move {count} emails from this sender to Trash?"):
+            total = sum(c for _, _, c in targets)
+            label = f"{len(targets)} senders ({total} emails)" if multi else f"{targets[0][2]} emails from {targets[0][1]}"
+            if Confirm.ask(f"Move {label} to Trash?"):
                 with console.status("Moving to Trash..."):
-                    n = batch_modify(service, ids, add_labels=["TRASH"], remove_labels=["INBOX"])
-                console.print(f"[green]Moved {n} emails to Trash.[/green]")
-                sorted_senders.pop(idx)
-                sender_ids.pop(sender, None)
-                if sender_tags:
-                    sender_tags.pop(sender, None)
-                _remove_sender_from_cache(sender)
+                    for _, s, _ in targets:
+                        batch_modify(service, sender_ids[s], add_labels=["TRASH"], remove_labels=["INBOX"])
+                console.print(f"[green]Moved emails from {len(targets)} sender(s) to Trash.[/green]")
+                for idx_, s, _ in sorted(targets, key=lambda x: x[0], reverse=True):
+                    sorted_senders.pop(idx_)
+                    sender_ids.pop(s, None)
+                    if sender_tags:
+                        sender_tags.pop(s, None)
+                    _remove_sender_from_cache(s)
                 page_start = min(page_start, max(0, len(sorted_senders) - 1))
         elif action == "mark_read":
             with console.status("Marking as read..."):
-                n = batch_modify(service, ids, remove_labels=["UNREAD"])
-            console.print(f"[green]Marked {n} emails as read.[/green]")
+                for _, s, _ in targets:
+                    batch_modify(service, sender_ids[s], remove_labels=["UNREAD"])
+            console.print(f"[green]Marked emails from {len(targets)} sender(s) as read.[/green]")
         elif action == "mark_unread":
             with console.status("Marking as unread..."):
-                n = batch_modify(service, ids, add_labels=["UNREAD"])
-            console.print(f"[green]Marked {n} emails as unread.[/green]")
+                for _, s, _ in targets:
+                    batch_modify(service, sender_ids[s], add_labels=["UNREAD"])
+            console.print(f"[green]Marked emails from {len(targets)} sender(s) as unread.[/green]")
 
 
 

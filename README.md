@@ -15,6 +15,7 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
 ## Features
 
 - **Sender analysis** - Scan emails, rank senders by count, then act on them (delete / trash / mark read / view emails). Results are cached locally so large scans don't need to be repeated.
+- **Multi-select** - Select multiple senders at once using `1,3,5` or ranges like `2-6`, then apply one action to all of them
 - **Smart tags** - Each sender is automatically tagged:
   - `newsletter` — has `List-Unsubscribe`/`List-Id` headers or is in Gmail's Promotions/Updates/Social category
   - `important` — at least one email was marked important by Gmail's ML
@@ -67,9 +68,16 @@ On first run, a browser window will open asking you to authorize the app. After 
 | 4 | Inbox stats |
 | 5 | View sender cache — browse cached results and act without re-scanning |
 | 6 | Clear sender cache — force a fresh scan next time |
+| 7 | Contact / Feedback — opens the GitHub repository |
+| 8 | Support me — opens Ko-fi page |
 
 ### Sender list navigation
-`[#]` select a sender · `[m]` next page · `[b]` back to top · `[0]` go back
+
+`[#]` select sender(s) · `[m]` next page · `[b]` back to top · `[0]` go back
+
+**Multi-select examples:** `1` · `1,3,5` · `2-6` · `1,3,7-10`
+Spaces after commas are fine: `1, 3, 5` works too.
+"view" is only available when selecting a single sender.
 
 ### Email viewer navigation (after selecting a sender → view)
 `[n]` next page · `[p]` prev page · `[i]` toggle important-only filter · `[q]` back to sender list
@@ -100,3 +108,7 @@ Sender analysis uses **8 parallel HTTP workers** with thread-local `AuthorizedSe
 - This script uses **OAuth 2.0** — your password is never stored or sent to this script.
 - `credentials.json` and `token.json` give access to your Gmail. They are listed in `.gitignore`.
 - The Gmail API scope used: `https://mail.google.com/` — required for permanent email deletion. No send or compose permissions are used.
+
+## Support
+
+If this tool helped you, consider supporting development on [Ko-fi](https://ko-fi.com/crakage). Feedback and issues welcome on [GitHub](https://github.com/littlecrakage/gmail-cleaning-helper).
