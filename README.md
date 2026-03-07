@@ -24,6 +24,7 @@ A local Python CLI to manage your Gmail inbox: analyze senders, bulk delete, tra
   - Falls back to opening the unsubscribe URL in your browser
   - Falls back to opening the `mailto:` unsubscribe link in your mail client
   - Optionally deletes or trashes all emails from unsubscribed senders
+- **Shield senders** - Mark senders as shielded to protect their emails from accidental deletion or trashing. Shielded senders are shown with a `shielded` tag and can be hidden from the list with a toggle. Shields can be removed at any time.
 - **Email viewer** - Browse a sender's emails (subject + from) with pagination, and filter to important-only before deciding to delete
 - **Search & bulk action** - Use any Gmail search query, then delete / trash / mark read
 - **Resume support** - Large scans are checkpointed every 200 emails. If interrupted, resume from where you left off
@@ -79,12 +80,13 @@ On first run, a browser window will open asking you to authorize the app. After 
 
 ### Sender list navigation
 
-`[#]` select sender(s) · `[m]` next page · `[b]` back to top · `[0]` go back
+`[#]` select sender(s) · `[m]` next page · `[b]` back to top · `[sf]` show/hide shielded · `[0]` go back
 
 **Multi-select examples:** `1` · `1,3,5` · `2-6` · `1,3,7-10`
 Spaces after commas are fine: `1, 3, 5` works too.
 "view" is only available when selecting a single sender.
 "label" prompts for a label name — if the label doesn't exist in Gmail it is created automatically.
+"shield" / "unshield" appear as actions based on the current shield state of the selected sender(s). Shielded senders cannot be deleted or trashed until unshielded.
 
 ### Email viewer navigation (after selecting a sender → view)
 `[n]` next page · `[p]` prev page · `[i]` toggle important-only filter · `[q]` back to sender list
@@ -111,6 +113,7 @@ After unsubscribing you are offered the option to delete or trash all existing e
 | `credentials.json` | OAuth client secrets (you provide this — do not commit) |
 | `token.json` | Saved auth token (auto-generated — do not commit) |
 | `sender_cache.json` | Cached sender scan results (auto-generated — do not commit) |
+| `shielded_senders.json` | List of shielded senders (auto-generated) |
 | `api_errors.log` | API error log — 429s, 5xx, network failures (auto-generated — do not commit) |
 | `auth.py` | OAuth2 login flow |
 | `gmail_helper.py` | Main interactive script |

@@ -1,5 +1,6 @@
 """Gmail Helper - Interactive CLI to manage your Gmail inbox."""
 
+import csv
 import json
 import logging
 import random
@@ -24,6 +25,7 @@ from rich.table import Table
 from auth import get_credentials
 
 CACHE_FILE = Path("sender_cache.json")
+SHIELD_FILE = Path("shielded_senders.json")
 LOG_FILE = Path("api_errors.log")
 
 console = Console()
@@ -268,6 +270,24 @@ def clear_cache():
 
 
 # ---------------------------------------------------------------------------
+# Shield helpers
+# ---------------------------------------------------------------------------
+
+def _load_shielded() -> set[str]:
+    """Return the set of shielded sender strings from disk."""
+    if not SHIELD_FILE.exists():
+        return set()
+    try:
+        return set(json.loads(SHIELD_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        return set()
+
+
+def _save_shielded(shielded: set[str]):
+    SHIELD_FILE.write_text(json.dumps(sorted(shielded), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # Feature: Sender analysis
 # ---------------------------------------------------------------------------
 
@@ -427,8 +447,10 @@ def analyze_senders(service, creds):
 PAGE_SIZE = 30
 
 
-def _fmt_tags(tags: set) -> str:
+def _fmt_tags(tags: set, shielded: bool = False) -> str:
     parts = []
+    if shielded:
+        parts.append("[bold blue]shielded[/bold blue]")
     if "important" in tags:
         parts.append("[bold yellow]important[/bold yellow]")
     if "newsletter" in tags:
@@ -436,7 +458,7 @@ def _fmt_tags(tags: set) -> str:
     return "  ".join(parts)
 
 
-def _print_sender_page(sorted_senders: list, start: int, end: int, title_suffix: str = "", sender_tags: dict | None = None):
+def _print_sender_page(sorted_senders: list, start: int, end: int, title_suffix: str = "", sender_tags: dict | None = None, shielded: set | None = None):
     end = min(end, len(sorted_senders))
     title = f"Senders {start + 1}–{end} of {len(sorted_senders)}{title_suffix}"
     table = Table(title=title, show_lines=False)
@@ -446,7 +468,8 @@ def _print_sender_page(sorted_senders: list, start: int, end: int, title_suffix:
     table.add_column("Tags", no_wrap=True)
     for idx, (sender, count) in enumerate(sorted_senders[start:end], start + 1):
         tags = (sender_tags or {}).get(sender, set())
-        table.add_row(str(idx), sender, str(count), _fmt_tags(tags))
+        is_shielded = sender in (shielded or set())
+        table.add_row(str(idx), sender, str(count), _fmt_tags(tags, is_shielded))
     console.print(table)
 
 
@@ -548,6 +571,41 @@ def _sender_to_email(sender: str) -> str:
     return m.group(1).strip() if m else sender.strip()
 
 
+def _fetch_emails_for_csv(creds, msg_ids: list[str]) -> list[dict]:
+    """Fetch From, Subject, Date metadata for a list of message IDs. Returns list of dicts."""
+    def fetch_one(mid: str) -> dict:
+        session = _get_session(creds)
+        url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}"
+        for attempt in range(6):
+            wait = (2 ** attempt) + random.uniform(0, 1)
+            try:
+                resp = session.get(url, params={
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "Subject", "Date"],
+                })
+                if resp.status_code == 200:
+                    data = resp.json()
+                    hdrs = {h["name"].lower(): h["value"] for h in data.get("payload", {}).get("headers", [])}
+                    return {
+                        "id": mid,
+                        "from": hdrs.get("from", ""),
+                        "subject": hdrs.get("subject", ""),
+                        "date": hdrs.get("date", ""),
+                    }
+                elif resp.status_code == 429 or resp.status_code >= 500:
+                    _api_log.warning(f"{resp.status_code}  mid={mid}  attempt={attempt}  wait={wait:.1f}s")
+                    time.sleep(wait)
+                else:
+                    break
+            except Exception as exc:
+                _api_log.warning(f"exception  mid={mid}  attempt={attempt}  error={exc}")
+                time.sleep(wait)
+        return {"id": mid, "from": "", "subject": "(error)", "date": ""}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        return list(executor.map(fetch_one, msg_ids))
+
+
 def _parse_selection(raw: str, max_n: int) -> list[int] | None:
     """Parse a comma-separated / range selection string into a deduplicated list of 1-based indices.
     Returns None on parse error or out-of-range input."""
@@ -603,18 +661,23 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
     page_start = 0
     redisplay = True
     dry_run = False
+    shielded = _load_shielded()
+    hide_shielded = False
 
     while True:
+        # Build the display list (optionally hiding shielded senders)
+        display_senders = [(s, c) for s, c in sorted_senders if not hide_shielded or s not in shielded]
+
         # (Re)display current page only when needed
-        if redisplay and page_start < len(sorted_senders):
-            _print_sender_page(sorted_senders, page_start, page_start + PAGE_SIZE, title_suffix, sender_tags)
+        if redisplay and page_start < len(display_senders):
+            _print_sender_page(display_senders, page_start, page_start + PAGE_SIZE, title_suffix, sender_tags, shielded)
         redisplay = True
 
-        shown_up_to = min(page_start + PAGE_SIZE, len(sorted_senders))
-        has_more = shown_up_to < len(sorted_senders)
+        shown_up_to = min(page_start + PAGE_SIZE, len(display_senders))
+        has_more = shown_up_to < len(display_senders)
         if has_more:
             console.print(
-                f"[dim]Showing {shown_up_to} of {len(sorted_senders)} senders.[/dim]"
+                f"[dim]Showing {shown_up_to} of {len(display_senders)} senders.[/dim]"
             )
 
         if dry_run:
@@ -626,6 +689,7 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
         if page_start > 0:
             nav_parts.append("[bold cyan]\\[b][/bold cyan] back to top")
         nav_parts.append(f"[bold cyan]\\[dr][/bold cyan] {'disable' if dry_run else 'enable'} dry run")
+        nav_parts.append(f"[bold cyan]\\[sf][/bold cyan] {'show' if hide_shielded else 'hide'} shielded")
         nav_parts.append("[bold cyan]\\[0][/bold cyan] go back")
         console.print("\n" + "   ".join(nav_parts))
         raw = Prompt.ask("Choice")
@@ -647,8 +711,13 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             console.print(f"[yellow]Dry run {'enabled' if dry_run else 'disabled'}.[/yellow]")
             redisplay = False
             continue
+        if raw.strip().lower() == "sf":
+            hide_shielded = not hide_shielded
+            page_start = 0
+            console.print(f"[yellow]Shielded senders {'hidden' if hide_shielded else 'shown'}.[/yellow]")
+            continue
 
-        selected_indices = _parse_selection(raw, len(sorted_senders))
+        selected_indices = _parse_selection(raw, len(display_senders))
         if selected_indices is None:
             console.print("[red]Enter number(s), e.g. 1  or  1,3,5  or  2-6.[/red]")
             continue
@@ -656,18 +725,28 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
         multi = len(selected_indices) > 1
 
         if multi:
-            names = [sorted_senders[i - 1][0] for i in selected_indices]
-            total_count = sum(sorted_senders[i - 1][1] for i in selected_indices)
+            names = [display_senders[i - 1][0] for i in selected_indices]
+            total_count = sum(display_senders[i - 1][1] for i in selected_indices)
             console.print(f"\nSelected [cyan]{len(selected_indices)} senders[/cyan] ({total_count} emails total):")
             for n, name in zip(selected_indices, names):
                 console.print(f"  [dim]{n}.[/dim] {name}")
-            action_choices = ["delete", "trash", "mark_read", "mark_unread", "label", "query", "back"]
+            any_shielded = any(display_senders[i - 1][0] in shielded for i in selected_indices)
+            any_unshielded = any(display_senders[i - 1][0] not in shielded for i in selected_indices)
+            action_choices = ["delete", "trash", "mark_read", "mark_unread", "label", "query", "export_csv"]
+            if any_unshielded:
+                action_choices.append("shield")
+            if any_shielded:
+                action_choices.append("unshield")
+            action_choices.append("back")
         else:
             idx = selected_indices[0] - 1
-            sender, count = sorted_senders[idx]
+            sender, count = display_senders[idx]
             ids = sender_ids[sender]
             console.print(f"\nSelected: [cyan]{sender}[/cyan] ({count} emails)")
-            action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "label", "query", "back"] if creds else ["delete", "trash", "mark_read", "mark_unread", "label", "query", "back"]
+            is_shielded = sender in shielded
+            action_choices = ["view", "delete", "trash", "mark_read", "mark_unread", "label", "query", "export_csv"] if creds else ["delete", "trash", "mark_read", "mark_unread", "label", "query", "export_csv"]
+            action_choices.append("unshield" if is_shielded else "shield")
+            action_choices.append("back")
 
         action = Prompt.ask(
             "Action",
@@ -683,39 +762,71 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             continue
 
         # --- Multi or single action ---
-        # Collect senders to act on (process in reverse index order for safe removal)
-        targets = [(i - 1, sorted_senders[i - 1][0], sorted_senders[i - 1][1]) for i in selected_indices]
+        targets = [(display_senders[i - 1][0], display_senders[i - 1][1]) for i in selected_indices]
+
+        if action == "shield":
+            newly_shielded = [s for s, _ in targets if s not in shielded]
+            for s in newly_shielded:
+                shielded.add(s)
+            _save_shielded(shielded)
+            console.print(f"[green]Shielded {len(newly_shielded)} sender(s). Their emails are protected from deletion.[/green]")
+            continue
+
+        if action == "unshield":
+            was_shielded = [s for s, _ in targets if s in shielded]
+            for s in was_shielded:
+                shielded.discard(s)
+            _save_shielded(shielded)
+            console.print(f"[green]Removed shield from {len(was_shielded)} sender(s).[/green]")
+            continue
 
         if action == "delete":
-            total = sum(c for _, _, c in targets)
-            label = f"{len(targets)} senders ({total} emails)" if multi else f"all {targets[0][2]} emails from {targets[0][1]}"
+            shielded_targets = [(s, c) for s, c in targets if s in shielded]
+            safe_targets = [(s, c) for s, c in targets if s not in shielded]
+            if shielded_targets:
+                console.print(f"[yellow]Skipping {len(shielded_targets)} shielded sender(s) — unshield them first to allow deletion.[/yellow]")
+            if not safe_targets:
+                continue
+            targets = safe_targets
+            multi = len(targets) > 1
+            total = sum(c for _, c in targets)
+            label = f"{len(targets)} senders ({total} emails)" if multi else f"all {targets[0][1]} emails from {targets[0][0]}"
             if dry_run:
                 console.print(f"[yellow][DRY RUN][/yellow] Would permanently delete {label}.")
             elif Confirm.ask(f"Permanently delete {label}?"):
                 with console.status("Deleting..."):
-                    for _, s, _ in targets:
+                    for s, _ in targets:
                         batch_delete(service, sender_ids[s])
-                n_deleted = len(targets)
-                console.print(f"[green]Deleted emails from {n_deleted} sender(s).[/green]")
-                for idx_, s, _ in sorted(targets, key=lambda x: x[0], reverse=True):
-                    sorted_senders.pop(idx_)
+                console.print(f"[green]Deleted emails from {len(targets)} sender(s).[/green]")
+                removed = {s for s, _ in targets}
+                sorted_senders[:] = [(s, c) for s, c in sorted_senders if s not in removed]
+                for s in removed:
                     sender_ids.pop(s, None)
                     if sender_tags:
                         sender_tags.pop(s, None)
                     _remove_sender_from_cache(s)
                 page_start = min(page_start, max(0, len(sorted_senders) - 1))
         elif action == "trash":
-            total = sum(c for _, _, c in targets)
-            label = f"{len(targets)} senders ({total} emails)" if multi else f"{targets[0][2]} emails from {targets[0][1]}"
+            shielded_targets = [(s, c) for s, c in targets if s in shielded]
+            safe_targets = [(s, c) for s, c in targets if s not in shielded]
+            if shielded_targets:
+                console.print(f"[yellow]Skipping {len(shielded_targets)} shielded sender(s) — unshield them first to allow trashing.[/yellow]")
+            if not safe_targets:
+                continue
+            targets = safe_targets
+            multi = len(targets) > 1
+            total = sum(c for _, c in targets)
+            label = f"{len(targets)} senders ({total} emails)" if multi else f"{targets[0][1]} emails from {targets[0][0]}"
             if dry_run:
                 console.print(f"[yellow][DRY RUN][/yellow] Would move {label} to Trash.")
             elif Confirm.ask(f"Move {label} to Trash?"):
                 with console.status("Moving to Trash..."):
-                    for _, s, _ in targets:
+                    for s, _ in targets:
                         batch_modify(service, sender_ids[s], add_labels=["TRASH"], remove_labels=["INBOX"])
                 console.print(f"[green]Moved emails from {len(targets)} sender(s) to Trash.[/green]")
-                for idx_, s, _ in sorted(targets, key=lambda x: x[0], reverse=True):
-                    sorted_senders.pop(idx_)
+                removed = {s for s, _ in targets}
+                sorted_senders[:] = [(s, c) for s, c in sorted_senders if s not in removed]
+                for s in removed:
                     sender_ids.pop(s, None)
                     if sender_tags:
                         sender_tags.pop(s, None)
@@ -723,20 +834,20 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                 page_start = min(page_start, max(0, len(sorted_senders) - 1))
         elif action == "mark_read":
             if dry_run:
-                total = sum(c for _, _, c in targets)
+                total = sum(c for _, c in targets)
                 console.print(f"[yellow][DRY RUN][/yellow] Would mark {total} emails from {len(targets)} sender(s) as read.")
             else:
                 with console.status("Marking as read..."):
-                    for _, s, _ in targets:
+                    for s, _ in targets:
                         batch_modify(service, sender_ids[s], remove_labels=["UNREAD"])
                 console.print(f"[green]Marked emails from {len(targets)} sender(s) as read.[/green]")
         elif action == "mark_unread":
             if dry_run:
-                total = sum(c for _, _, c in targets)
+                total = sum(c for _, c in targets)
                 console.print(f"[yellow][DRY RUN][/yellow] Would mark {total} emails from {len(targets)} sender(s) as unread.")
             else:
                 with console.status("Marking as unread..."):
-                    for _, s, _ in targets:
+                    for s, _ in targets:
                         batch_modify(service, sender_ids[s], add_labels=["UNREAD"])
                 console.print(f"[green]Marked emails from {len(targets)} sender(s) as unread.[/green]")
         elif action == "label":
@@ -756,16 +867,16 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
                 console.print("[yellow]No label name entered, skipping.[/yellow]")
                 continue
             if dry_run:
-                total = sum(c for _, _, c in targets)
+                total = sum(c for _, c in targets)
                 console.print(f"[yellow][DRY RUN][/yellow] Would apply label '[bold]{label_name}[/bold]' to {total} emails from {len(targets)} sender(s).")
             else:
                 with console.status(f"Applying label '{label_name}'..."):
                     label_id = get_or_create_label(service, label_name)
-                    for _, s, _ in targets:
+                    for s, _ in targets:
                         batch_modify(service, sender_ids[s], add_labels=[label_id])
                 console.print(f"[green]Applied label '[bold]{label_name}[/bold]' to emails from {len(targets)} sender(s).[/green]")
         elif action == "query":
-            emails = [_sender_to_email(s) for _, s, _ in targets]
+            emails = [_sender_to_email(s) for s, _ in targets]
             if len(emails) == 1:
                 query_str = f"from:{emails[0]}"
             else:
@@ -773,6 +884,27 @@ def _display_and_act(service, sorted_senders: list, sender_ids: dict, title_suff
             console.print(f"\n[bold]Gmail search query:[/bold]")
             console.print(f"[bold cyan]{query_str}[/bold cyan]\n")
             console.print("[dim]Paste this into the Gmail search bar.[/dim]")
+        elif action == "export_csv":
+            if not creds:
+                console.print("[red]Export requires authentication (creds not available).[/red]")
+                continue
+            all_ids = []
+            for s, _ in targets:
+                all_ids.extend(sender_ids[s])
+            total = len(all_ids)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if len(targets) == 1:
+                safe_name = re.sub(r"[^\w\-.]", "_", _sender_to_email(targets[0][0]))[:40]
+                csv_path = Path(f"gmail_export_{safe_name}_{timestamp}.csv")
+            else:
+                csv_path = Path(f"gmail_export_{len(targets)}senders_{timestamp}.csv")
+            with console.status(f"Fetching metadata for {total} emails..."):
+                rows = _fetch_emails_for_csv(creds, all_ids)
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "from", "subject", "date"])
+                writer.writeheader()
+                writer.writerows(rows)
+            console.print(f"[green]Exported {len(rows)} emails to [bold]{csv_path}[/bold][/green]")
 
 
 # ---------------------------------------------------------------------------
