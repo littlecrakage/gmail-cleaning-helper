@@ -6,3 +6,4 @@ api_errors.log
 __pycache__/
 *.pyc
 .claude/
+shielded_senders.json
